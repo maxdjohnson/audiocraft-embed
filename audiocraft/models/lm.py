@@ -222,10 +222,11 @@ class LMModel(StreamingModule):
                 condition_tensors: tp.Optional[ConditionTensors] = None) -> torch.Tensor:
         """Apply language model on sequence and conditions.
         Given a tensor of sequence of shape [B, K, S] with K the number of codebooks and
-        S the sequence steps, return the logits with shape [B, card, K, S].
+        S the sequence steps, return an embedding representing the whole sequence of shape [B, dim]
+        where dim is the dimension of the transformer encoder.
 
         Args:
-            indices (torch.Tensor): Indices of the codes to model.
+            sequence (torch.Tensor): Sequence of codes
             conditions (list of ConditioningAttributes): Conditions to use when modeling
                 the given codes. Note that when evaluating multiple time with the same conditioning
                 you should pre-compute those and pass them as `condition_tensors`.
@@ -253,58 +254,41 @@ class LMModel(StreamingModule):
         out = self.transformer(input_, cross_attention_src=cross_attention_input)
         if self.out_norm:
             out = self.out_norm(out)
-        logits = torch.stack([self.linears[k](out) for k in range(K)], dim=1)  # [B, K, S, card]
+        return out
 
-        # remove the prefix from the model outputs
-        if len(self.fuser.fuse2cond['prepend']) > 0:
-            logits = logits[:, :, -S:]
-
-        return logits  # [B, K, S, card]
-
-    def compute_predictions(
-            self, codes: torch.Tensor,
-            conditions: tp.List[ConditioningAttributes],
-            condition_tensors: tp.Optional[ConditionTensors] = None) -> LMOutput:
-        """Given an input tensor of codes [B, K, T] and list of conditions, runs the model
-        forward using the specified codes interleaving pattern.
+    def compute_sequence_embedding(self, codes, context_limit, window_size=None):
+        """Given an input tensor of codes [K, T], generates the mean embedding using the transformer
+        model. This splits the input into batches of size `context_limit`. window_size determines
+        how much of the batch is used for embedding vs just as context. window_size defaults
+        to context_limit / 2.
 
         Args:
-            codes (torch.Tensor): Input codes of shape [B, K, T] with B the batch size,
-                K the number of codebooks and T the number of timesteps.
-            conditions (list of ConditioningAttributes): conditionings to use when modeling
-                the given codes. Note that when evaluating multiple time with the same conditioning
-                you should pre-compute those and pass them as `condition_tensors`.
-            condition_tensors (dict[str, ConditionType], optional): pre-computed conditioning
-                tensors, see `conditions`.
+            codes (torch.Tensor): Input codes of shape [K, T] with K the number of codebooks and T the number of timesteps.
+            context_limit (int): Codes will be batched by T dimension with this batch size.
+            window_size (int): determines how much of the batch is used for embedding vs just
+                as context. defaults to context_limit / 2.
         Returns:
-            LMOutput: Language model outputs
-                logits (torch.Tensor) of shape [B, K, T, card] corresponding to the provided codes,
-                    i.e. the first item corresponds to logits to predict the first code, meaning that
-                    no additional shifting of codes and logits is required.
-                mask (torch.Tensor) of shape [B, K, T], mask over valid and invalid positions.
-                    Given the specified interleaving strategies, parts of the logits and codes should
-                    not be considered as valid predictions because of invalid context.
+            torch.Tensor: Sequence embedding of shape [B, dim] where dim is the dimension of the transformer encoder.
         """
-        B, K, T = codes.shape
-        codes = codes.contiguous()
-        # map codes [B, K, T] into pattern sequence [B, K, S] using special_token_id for masked tokens
-        pattern = self.pattern_provider.get_pattern(T)
-        sequence_codes, sequence_indexes, sequence_mask = pattern.build_pattern_sequence(
-            codes, self.special_token_id, keep_only_valid_steps=True
-        )
-        # apply model on pattern sequence
+        K, T = codes.shape
+        if window_size is None:
+            window_size = int(context_limit / 2)
+        idxs = batch_indexes(T, context_limit, window_size)
+        inputs = torch.zeros(len(idxs), K, max(b-a for (a, b, _) in idxs), dtype=codes.dtype)
+        for i, (batch_start, batch_end, _) in enumerate(idxs):
+            for j in range(K):
+                inputs[i, j, :] = codes[j, batch_start:batch_end]
+        inputs = inputs.to(codes.device)
         model = self if self._fsdp is None else self._fsdp
-        logits = model(sequence_codes, conditions, condition_tensors)  # [B, K, S, card]
-        # map back the logits on pattern sequence to logits on original codes: [B, K, S, card] -> [B, K, T, card]
-        # and provide the corresponding mask over invalid positions of tokens
-        logits = logits.permute(0, 3, 1, 2)  # [B, card, K, S]
-        # note: we use nans as special token to make it obvious if we feed unexpected logits
-        logits, logits_indexes, logits_mask = pattern.revert_pattern_logits(
-            logits, float('nan'), keep_only_valid_steps=True
-        )
-        logits = logits.permute(0, 2, 3, 1)  # [B, K, T, card]
-        logits_mask = logits_mask[None, :, :].expand(B, -1, -1)  # [K, T] -> [B, K, T]
-        return LMOutput(logits, logits_mask)
+        with torch.no_grad():
+            embeddings = model(inputs, [ConditioningAttributes(text={'description': None}) for _ in inputs])
+        _, _, dim = embeddings.shape
+        out = torch.zeros(dim, dtype=embeddings.dtype)
+        for i, (batch_start, _, window_start) in enumerate(idxs):
+            start = window_start - batch_start
+            out += torch.sum(embeddings[i, start:, :], dim=0)
+        out /= len(codes)
+        return out
 
     def _sample_next_token(self,
                            sequence: torch.Tensor,
@@ -529,3 +513,17 @@ class LMModel(StreamingModule):
         # ensure the returned codes are all valid
         assert (out_codes >= 0).all() and (out_codes <= self.card).all()
         return out_codes
+
+def batch_indexes(total_len, context_limit, window_size):
+    # Tuples (batch_start, batch_end, window_start)
+    start = min(context_limit, total_len)
+    idxs = [(0, start, 0)]
+    for window_start in range(start, total_len, window_size):
+        batch_end = window_start + window_size
+        if batch_end > total_len:
+            batch_end = total_len
+        batch_start = batch_end - context_limit
+        idxs.append((batch_start, batch_end, window_start))
+    return idxs
+
+
